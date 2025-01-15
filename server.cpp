@@ -11,7 +11,9 @@
 #include <vector>
 #include <format>
 #include <sstream>
+#include <map>
 #include "trace.h"
+#include "fcntl.h"
 #define PORT 6969
 #define MAX_SIZE 4096
 
@@ -20,6 +22,32 @@
         perror(msg);           \
         exit(err);             \
     }
+
+std::map<std::string, std::string> parse_flags(const std::string &flags)
+{
+    std::istringstream iss(flags);
+    std::string token;
+    std::string lastFlag;
+    std::map<std::string, std::string> parsedFlags;
+
+    while (iss >> token)
+    {
+        if (token[0] == '-')
+        {
+            if (token.size() > 1)
+            {
+                lastFlag = token;
+                parsedFlags[lastFlag] = "";
+            }
+        }
+        else if (!lastFlag.empty())
+        {
+            parsedFlags[lastFlag] = token;
+            lastFlag.clear();
+        }
+    }
+    return parsedFlags;
+}
 
 void handle_client(int socket)
 {
@@ -37,14 +65,25 @@ void handle_client(int socket)
 
     std::cout << header << " connected to client\n";
 
+    int flags = fcntl(socket, F_GETFL, 0);
+    fcntl(socket, F_SETFL, flags | O_NONBLOCK);
+
     while (true)
     {
-        std::cout << header << " waiting for a message ...\n";
-        if (read(socket, &msg, sizeof(msg)) < 0)
+        memset(msg, 0, sizeof(msg));
+        ssize_t bytes_read = read(socket, &msg, sizeof(msg));
+        if (bytes_read < 0)
         {
-            perror("[server]Error at read()\n");
-            close(socket);
-            return;
+            if (errno == EWOULDBLOCK || errno == EAGAIN)
+            {
+                continue;
+            }
+            else
+            {
+                perror("[server]Error at read()\n");
+                close(socket);
+                return;
+            }
         }
 
         std::string message(msg);
@@ -53,10 +92,11 @@ void handle_client(int socket)
             std::cout << header << " received quit command\n";
             break;
         }
-        if (message == "trace help")
+        if (message == "trace -h")
         {
             std::cout << header << " received commanad: trace -h\n";
-            strcpy(res, "\nd       switching display mode\nr       reset all counters");
+            strncpy(res, "Usage:\ntrace hostname [flags]\n\nKeyBindings:\n-h              help\n-q              quits\n-s              stop trace\n-p              pause/unpause trace\nFlags:\n-d [duration]   delay between traces in seconds\n-m [number]     max number of hops\n", MAX_SIZE - 1);
+            res[MAX_SIZE - 1] = '\0';
         }
         else if (message.find("trace ") == 0)
         {
@@ -68,15 +108,130 @@ void handle_client(int socket)
             std::string flags = (pos != std::string::npos) ? arg.substr(pos + 1) : "";
 
             std::cout << std::format("{} received command: trace <{}> <{}>\n", header, path, flags);
-            strcpy(res, "Not implemented yet. :) Maybe try mtr ");
-            strcat(res, arg.c_str());
+
+            std::map<std::string, std::string> flg = parse_flags(flags);
+
+            // strncpy(res, "Starting trace...\n", MAX_SIZE - 1);
+            // res[MAX_SIZE - 1] = '\0';
+            if (write(socket, res, MAX_SIZE) < 0)
+            {
+                perror("[server]Error at write()\n");
+                close(socket);
+                return;
+            }
+            bool stopped = false;
+            bool paused = false;
+            bool hdr = true;
+            int sleep_time = 0;
+            Tracer tracer{path};
+            for (auto &f : flg)
+            {
+                if (f.first == "-d")
+                    sleep_time = atoi(f.second.c_str());
+                if (f.first == "-m")
+                    tracer.MAX_HOPS = atoi(f.second.c_str());
+            }
+            while (!stopped)
+            {
+                if (!paused)
+                {
+                    tracer.run();
+                    std::vector<line> log_lines = log(tracer);
+                    std::ostringstream oss;
+
+                    std::vector<int> px = {24, 4, 5, 8, 7, 7};
+                    std::vector<std::string> names = {"Host", "Loss%", "Snt", "Avg", "Best", "Wrst", "StDev"};
+                    for (int i = 0; i < names.size(); i++)
+                    {
+                        oss << names[i] << std::string(px[i], ' ');
+                    }
+                    oss << '\n';
+
+                    for (int i = 0; i < log_lines.size(); i++)
+                    {
+                        const auto &line = log_lines[i];
+                        oss << std::fixed << std::setprecision(2);
+
+                        if (i < 10)
+                            oss << " ";
+                        oss << i << ". ";
+                        if (line.ip.empty())
+                        {
+                            oss << "(waiting for reply)\n";
+                        }
+                        else
+                        {
+                            auto &h = line;
+                            int ip_length = h.ip.size();
+                            int loss_spacing = 25 - ip_length;
+                            oss << std::fixed << std::setprecision(2);
+                            oss << h.ip
+                                << std::string(std::max(0, loss_spacing), ' ') << h.loss
+                                << std::string(5, ' ') << (int)h.snt
+                                << std::string(std::max(0, 15 - (int)std::to_string(h.avg).size()), ' ') << h.avg
+                                << std::string(std::max(0, 15 - (int)std::to_string(h.best).size()), ' ') << h.best
+                                << std::string(std::max(0, 15 - (int)std::to_string(h.wrst).size()), ' ') << h.wrst
+                                << std::string(std::max(0, 15 - (int)std::to_string(h.stdev).size()), ' ') << h.stdev
+                                << '\n';
+                        }
+                    }
+                    std::string log_str = oss.str();
+                    strncpy(res, log_str.c_str(), MAX_SIZE - 1);
+                    res[MAX_SIZE - 1] = '\0';
+                    if (write(socket, res, MAX_SIZE) < 0)
+                    {
+                        perror("[server]Error at write()\n");
+                        close(socket);
+                        return;
+                    }
+                    sleep(sleep_time);
+                }
+
+                memset(msg, 0, sizeof(msg));
+                int bytes_read = read(socket, &msg, sizeof(msg));
+                if (bytes_read < 0)
+                {
+                    if (errno == EWOULDBLOCK || errno == EAGAIN)
+                    {
+                        continue;
+                    }
+                    else
+                    {
+                        perror("[server]Error at read()\n");
+                        close(socket);
+                        return;
+                    }
+                }
+                std::string message{msg};
+                if (bytes_read > 0)
+                {
+
+                    if (message == "s")
+                    {
+                        std::cout << header << " received stop command\n";
+                        stopped = true;
+                        break;
+                    }
+                    else if (message == "p")
+                    {
+                        std::cout << header << " received pause command\n";
+                        paused = !paused;
+                    }
+                    else if (message == "q")
+                    {
+                        std::cout << header << " closing connection\n";
+                        close(socket);
+                        return;
+                    }
+                }
+            }
         }
         else
         {
             std::cout << header << " received unknown command: " << message << "\n";
-            strcpy(res, "received unknown command");
+            strncpy(res, "received unknown command", MAX_SIZE - 1);
+            res[MAX_SIZE - 1] = '\0';
         }
-
         if (write(socket, res, MAX_SIZE) < 0)
         {
             perror("[server]Error at write()\n");
