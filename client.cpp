@@ -32,39 +32,6 @@ struct line
     double loss, snt, last, avg, best, wrst, stdev;
 };
 
-std::vector<line> parseTrace(const std::string &str)
-{
-    std::vector<line> ans;
-    std::istringstream stream(str);
-    std::string line_str;
-
-    while (std::getline(stream, line_str))
-    {
-        std::istringstream line_stream(line_str);
-        line l;
-        std::string temp;
-
-        // Parse the line number
-        line_stream >> temp;
-
-        // Parse the IP address or "(waiting for reply)"
-        line_stream >> l.ip;
-
-        if (l.ip == "(waiting")
-        {
-            // Skip the rest of the line
-            continue;
-        }
-
-        // Parse the rest of the fields
-        line_stream >> l.loss >> l.snt >> l.last >> l.avg >> l.best >> l.wrst >> l.stdev;
-
-        ans.push_back(l);
-    }
-
-    return ans;
-}
-
 int port;
 int main(int argc, char *argv[])
 {
@@ -145,7 +112,7 @@ int main(int argc, char *argv[])
             std::cout << msg;
             for (int i = 0; i < new_lines + 1; i++)
             {
-                std::cout << "\033[F"; // Move cursor up one line
+                std::cout << "\033[F";
             }
         }
 
